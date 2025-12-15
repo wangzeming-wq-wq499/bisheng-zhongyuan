@@ -1259,20 +1259,20 @@ class KnowledgeService(KnowledgeUtils):
 
     @classmethod
     def search_file_ids_by_text(
-            cls, 
-            text: str, 
-            knowledge_id: int, 
+            cls,
+            text: str,
+            knowledge_id: int,
             n: int = 200,
-            es_client: Elasticsearch = None
+            es_client = None
     ) -> List[int]:
         """
         根据文本从文档知识库的ES中搜索，直到获取到大于n个唯一文件ID
-        
+
         Args:
             text: 搜索文本
             knowledge_id: 文档知识库ID
             n: 需要获取的文件ID数量阈值
-            
+
         Returns:
             List[int]: 唯一的文件ID列表
         """
@@ -1282,13 +1282,13 @@ class KnowledgeService(KnowledgeUtils):
             raise NotFoundError.http_exception()
         if not es_client:
             es_client = KnowledgeRag.init_knowledge_es_vectorstore_sync(knowledge)
-        
+
         unique_file_ids = set()
         batch_size = 2000
         from_offset = 0
-        
+
         logger.info(f"start search_file_ids_by_text knowledge_id={knowledge_id} text={text[:50]}... n={n}")
-        
+
         while len(unique_file_ids) <= n:
             # 构建搜索请求
             search_data = {
@@ -1299,53 +1299,53 @@ class KnowledgeService(KnowledgeUtils):
                 },
                 "_source": ["metadata.document_id"]
             }
-            
+
             try:
                 res = es_client.client.search(index=knowledge.index_name, body=search_data)
             except Exception as e:
                 logger.warning(f"search_file_ids_by_text error={str(e)}")
                 raise KnowledgeChunkError.http_exception()
-            
+
             # 提取文件ID
             hits = res["hits"]["hits"]
             if not hits:
                 # 没有更多结果，退出循环
                 break
-            
+
             # 收集唯一文件ID
             for hit in hits:
                 file_id = hit["_source"]["metadata"]["document_id"]
                 unique_file_ids.add(file_id)
-            
+
             logger.debug(f"batch search completed: from={from_offset}, size={len(hits)}, unique_file_ids={len(unique_file_ids)}")
-            
+
             # 更新偏移量
             from_offset += batch_size
-            
+
             # 防止无限循环，设置最大搜索次数
             if from_offset > 100000:
                 logger.warning(f"search_file_ids_by_text reached max offset: {from_offset}")
                 break
-        
+
         logger.info(f"search_file_ids_by_text completed: found {len(unique_file_ids)} unique file ids")
         return list(unique_file_ids)
-    
+
 
     @classmethod
     def get_similar_files_by_text(
-            cls, 
-            text: str, 
-            knowledge_id: int, 
+            cls,
+            text: str,
+            knowledge_id: int,
             n: int = 200
     ) -> List[dict]:
         """
         根据文本搜索相似文件，返回文件ID、URL和相似度
-        
+
         Args:
             text: 搜索文本
             knowledge_id: 文档知识库ID
             n: 需要获取的文件ID数量阈值
-            
+
         Returns:
             List[dict]: 包含文件ID、URL和相似度的字典列表
         """
@@ -1365,12 +1365,14 @@ class KnowledgeService(KnowledgeUtils):
             raise NotFoundError.http_exception()
         es_client = KnowledgeRag.init_knowledge_es_vectorstore_sync(knowledge)
 
-        file_ids = cls.search_file_ids_by_text(text, knowledge_id, n, es_client)
+        file_info = KnowledgeFileDao.get_file_by_condition(knowledge_id)
+        file_ids = [one.id for one in file_info]
+        logger.info(f"search_file_ids {file_ids}")
         base_set = get_text_tzset(text)
         result = []
         search_data = {
-                "query": {
-                    "term": {"metadata.document_id": file_id}
+                "post_filter": {
+                    "terms": {"metadata.document_id": file_ids}
                 },
                 "sort": [
                 {
@@ -1390,19 +1392,18 @@ class KnowledgeService(KnowledgeUtils):
             ],
                 "size": 10000  # 设置足够大的size以获取所有分块
             }
-            
+
         try:
             res = es_client.client.search(index=knowledge.index_name, body=search_data)
         except Exception as e:
             logger.warning(f"get_file_chunks error={str(e)}")
-        
+
         # 拼接所有分块文本
         file_chunks = res["hits"]["hits"]
-        file_text = ""
-        
-        
+
         for file_id in file_ids:
             # 获取文件URL
+            file_text = ""
             original_url, preview_url = cls.get_file_share_url(file_id)
             # 从ES中获取该文件的所有分块
             for chunk in file_chunks:
@@ -1412,10 +1413,10 @@ class KnowledgeService(KnowledgeUtils):
                 # 提取分块文本并过滤元数据
                 chunk_text = KnowledgeUtils.split_chunk_metadata(chunk["_source"]["text"])
                 file_text += chunk_text + " "
-            
+
             # 计算相似度
             file_tzset = get_text_tzset(file_text)
-            # similar = len(base_set & file_tzset) / len(base_set | file_tzset) # 杰卡德相似度,代码效率低，启用，下面代码完全等价
+            # similar = len(base_set & file_tzset) / len(base_set | file_tzset) # 杰卡德相似度,代码效率低，放弃使用，下面代码完全等价
             fz = 0
             fm = len(base_set)
             for s in file_tzset:
@@ -1431,4 +1432,5 @@ class KnowledgeService(KnowledgeUtils):
                 "preview_url": preview_url,
                 "similar": similar
             })
-        return result
+        result.sort(key=lambda x:-x['similar'])
+        return result[:n]

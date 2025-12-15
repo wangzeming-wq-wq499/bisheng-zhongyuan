@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import urllib.parse
 from datetime import datetime
 from io import BytesIO
@@ -1026,11 +1027,13 @@ async def similar_files_by_url(
         
         # 4. 搜索相似文件
         logger.info(f"start search similar files, knowledge_id: {knowledge_id}, text_len: {len(file_content[:100])}...")
+        start_time = time.time()
         similar_files = KnowledgeService.get_similar_files_by_text(
             text=file_content,
             knowledge_id=knowledge_id,
             n=top_k
         )
+        logger.info(f"search similar files use time is {time.time() - start_time}")
         
         # 5. 清理临时文件
         import os
