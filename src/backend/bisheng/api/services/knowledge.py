@@ -1330,6 +1330,78 @@ class KnowledgeService(KnowledgeUtils):
         logger.info(f"search_file_ids_by_text completed: found {len(unique_file_ids)} unique file ids")
         return list(unique_file_ids)
 
+    @classmethod
+    def _scroll_file_chunks(cls, es_client, index_name, file_ids, batch_size=10000):
+        """
+        使用ES scroll API获取所有文件分块
+        :param es_client: Elasticsearch客户端
+        :param index_name: 索引名称
+        :param file_ids: 文件ID列表
+        :param batch_size: 每次scroll返回的数量
+        :return: 生成器，逐个返回分块
+        """
+        search_data = {
+            "post_filter": {
+                "terms": {"metadata.document_id": file_ids}
+            },
+            "sort": [
+                {
+                    "metadata.document_id": {
+                        "order": "desc",
+                        "missing": 0,
+                        "unmapped_type": "long",
+                    }
+                },
+                {
+                    "metadata.chunk_index": {
+                        "order": "asc",
+                        "missing": 0,
+                        "unmapped_type": "long",
+                    }
+                },
+            ],
+            "size": batch_size  # 每次scroll返回的数量
+        }
+
+        try:
+            # 初始化scroll，获取第一批数据
+            res = es_client.client.search(
+                index=index_name,
+                body=search_data,
+                scroll="5m"  # scroll上下文保持5分钟
+            )
+
+            scroll_id = res["_scroll_id"]
+            hits = res["hits"]["hits"]
+
+            # 处理第一批数据
+            for hit in hits:
+                yield hit
+
+            # 继续获取后续批次数据
+            while len(hits) > 0:
+                res = es_client.client.scroll(
+                    scroll_id=scroll_id,
+                    scroll="5m"
+                )
+                scroll_id = res["_scroll_id"]
+                hits = res["hits"]["hits"]
+
+                for hit in hits:
+                    yield hit
+
+            # 清理scroll上下文
+            es_client.client.clear_scroll(scroll_id=scroll_id)
+
+        except Exception as e:
+            logger.warning(f"_scroll_file_chunks error={str(e)}")
+            # 确保scroll上下文被清理
+            if 'scroll_id' in locals():
+                try:
+                    es_client.client.clear_scroll(scroll_id=scroll_id)
+                except Exception:
+                    pass
+            return
 
     @classmethod
     def get_similar_files_by_text(
@@ -1359,7 +1431,7 @@ class KnowledgeService(KnowledgeUtils):
                 wc[ngram_text] = wc.get(ngram_text, 0) + 1
                 result.add(f"{ngram_text}_{wc[ngram_text]}")
             return result
-                # 初始化ES客户端
+        # 初始化ES客户端 
         knowledge = KnowledgeDao.query_by_id(knowledge_id)
         if not knowledge:
             raise NotFoundError.http_exception()
@@ -1370,67 +1442,40 @@ class KnowledgeService(KnowledgeUtils):
         logger.info(f"search_file_ids {file_ids}")
         base_set = get_text_tzset(text)
         result = []
-        search_data = {
-                "post_filter": {
-                    "terms": {"metadata.document_id": file_ids}
-                },
-                "sort": [
-                {
-                    "metadata.document_id": {
-                        "order": "desc",
-                        "missing": 0,
-                        "unmapped_type": "long",
-                    }
-                },
-                {
-                    "metadata.chunk_index": {
-                        "order": "asc",
-                        "missing": 0,
-                        "unmapped_type": "long",
-                    }
-                },
-            ],
-                "size": 10000  # 设置足够大的size以获取所有分块
-            }
-
-        try:
-            res = es_client.client.search(index=knowledge.index_name, body=search_data)
-        except Exception as e:
-            logger.warning(f"get_file_chunks error={str(e)}")
-
-        # 拼接所有分块文本
-        file_chunks = res["hits"]["hits"]
-
-        for file_id in file_ids:
-            # 获取文件URL
-            file_text = ""
-            original_url, preview_url = cls.get_file_share_url(file_id)
-            # 从ES中获取该文件的所有分块
-            for chunk in file_chunks:
-                # 检查分块是否属于当前文件
-                if chunk["_source"]["metadata"]["document_id"] != file_id:
-                    continue
-                # 提取分块文本并过滤元数据
+        # 使用scroll API获取所有分块
+        file_chunks = cls._scroll_file_chunks(es_client, knowledge.index_name, file_ids)
+        file_id = None
+        file_text = ""
+        # 从ES中获取该文件的所有分块
+        for chunk in file_chunks:
+            # 检查分块是否属于当前文件
+            if file_id is None:
+                file_id = chunk["_source"]["metadata"]["document_id"]
+            # 提取分块文本并过滤元数据
+            if file_id == chunk["_source"]["metadata"]["document_id"]:
                 chunk_text = KnowledgeUtils.split_chunk_metadata(chunk["_source"]["text"])
-                file_text += chunk_text + " "
+                file_text += chunk_text
+                continue
 
             # 计算相似度
             file_tzset = get_text_tzset(file_text)
-            # similar = len(base_set & file_tzset) / len(base_set | file_tzset) # 杰卡德相似度,代码效率低，放弃使用，下面代码完全等价
-            fz = 0
-            fm = len(base_set)
-            for s in file_tzset:
-                if s in base_set:
-                    fz += 1
-                else:
-                    fm += 1
-            similar = fz / fm
-
+            original_url, preview_url = cls.get_file_share_url(file_id)
             result.append({
                 "file_id": file_id,
                 "file_url": original_url,
                 "preview_url": preview_url,
-                "similar": similar
+                "similar": len(base_set & file_tzset) / len(base_set | file_tzset)
             })
+            file_id = chunk["_source"]["metadata"]["document_id"]
+            file_text = KnowledgeUtils.split_chunk_metadata(chunk["_source"]["text"])
+        # 计算相似度
+        file_tzset = get_text_tzset(file_text)
+        original_url, preview_url = cls.get_file_share_url(file_id)
+        result.append({
+            "file_id": file_id,
+            "file_url": original_url,
+            "preview_url": preview_url,
+            "similar": len(base_set & file_tzset) / len(base_set | file_tzset)
+        })
         result.sort(key=lambda x:-x['similar'])
         return result[:n]
