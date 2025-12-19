@@ -1340,6 +1340,8 @@ class KnowledgeService(KnowledgeUtils):
         :param batch_size: 每次scroll返回的数量
         :return: 生成器，逐个返回分块
         """
+        if not file_ids:
+            return
         search_data = {
             "post_filter": {
                 "terms": {"metadata.document_id": file_ids}
@@ -1421,9 +1423,20 @@ class KnowledgeService(KnowledgeUtils):
         Returns:
             List[dict]: 包含文件ID、URL和相似度的字典列表
         """
+        # 预处理文本
+        text = text.replace("\n","").replace(" ","")
+        
+        # 初始化Redis客户端
+        from bisheng.core.cache.redis_manager import get_redis_client_sync
+        redis_client = get_redis_client_sync()
+        
+        # 生成文件ngram集合的Redis键
+        def get_ng_word_key(file_id: str) -> str:
+            return f"file_ngram:{file_id}"
+
+        # 生成文本的ngram集合
         def get_text_tzset(text):
-            text = text.strip().replace("\n", "").replace(" ", "")
-            ngram = 5
+            ngram = 2
             wc = {}
             result = set()
             for i in range(len(text) - ngram + 1):
@@ -1431,51 +1444,128 @@ class KnowledgeService(KnowledgeUtils):
                 wc[ngram_text] = wc.get(ngram_text, 0) + 1
                 result.add(f"{ngram_text}_{wc[ngram_text]}")
             return result
-        # 初始化ES客户端 
+        
+        # 初始化ES客户端
         knowledge = KnowledgeDao.query_by_id(knowledge_id)
         if not knowledge:
             raise NotFoundError.http_exception()
         es_client = KnowledgeRag.init_knowledge_es_vectorstore_sync(knowledge)
 
+        # 获取所有文件ID
         file_info = KnowledgeFileDao.get_file_by_condition(knowledge_id)
-        file_ids = [one.id for one in file_info]
-        logger.info(f"search_file_ids {file_ids}")
+        file_ids_all = [one.id for one in file_info]
+        file_ids_need_es = []
+        
+        # 生成搜索文本的ngram集合
         base_set = get_text_tzset(text)
         result = []
-        # 使用scroll API获取所有分块
-        file_chunks = cls._scroll_file_chunks(es_client, knowledge.index_name, file_ids)
-        file_id = None
-        file_text = ""
-        # 从ES中获取该文件的所有分块
-        for chunk in file_chunks:
-            # 检查分块是否属于当前文件
-            if file_id is None:
-                file_id = chunk["_source"]["metadata"]["document_id"]
-            # 提取分块文本并过滤元数据
-            if file_id == chunk["_source"]["metadata"]["document_id"]:
-                chunk_text = KnowledgeUtils.split_chunk_metadata(chunk["_source"]["text"])
-                file_text += chunk_text
-                continue
 
-            # 计算相似度
-            file_tzset = get_text_tzset(file_text)
-            original_url, preview_url = cls.get_file_share_url(file_id)
-            result.append({
-                "file_id": file_id,
-                "file_url": original_url,
-                "preview_url": preview_url,
-                "similar": len(base_set & file_tzset) / len(base_set | file_tzset)
-            })
-            file_id = chunk["_source"]["metadata"]["document_id"]
-            file_text = KnowledgeUtils.split_chunk_metadata(chunk["_source"]["text"])
-        # 计算相似度
-        file_tzset = get_text_tzset(file_text)
-        original_url, preview_url = cls.get_file_share_url(file_id)
-        result.append({
-            "file_id": file_id,
-            "file_url": original_url,
-            "preview_url": preview_url,
-            "similar": len(base_set & file_tzset) / len(base_set | file_tzset)
-        })
+        logger.info(f"search_file_ids {file_ids_all}")
+        
+        # 记录开始时间
+        import time
+        start_time = time.time()
+        
+        # 1. 先从Redis获取每个文件的ngram集合，立即计算相似度
+        for file_id in file_ids_all:
+            ng_word_key = get_ng_word_key(file_id)
+            # 使用get而不是hgetall，因为我们存储的是完整的ngram集合
+            cached_ngram = redis_client.get(ng_word_key)
+            if cached_ngram:
+                # 立即计算相似度，不存储集合
+                similarity = len(base_set & cached_ngram) / len(base_set | cached_ngram) if (base_set | cached_ngram) else 0
+                
+                # 获取文件URL
+                original_url, preview_url = cls.get_file_share_url(file_id)
+                
+                # 添加到结果列表
+                result.append({
+                    "file_id": file_id,
+                    "file_url": original_url,
+                    "preview_url": preview_url,
+                    "similar": similarity
+                })
+            else:
+                file_ids_need_es.append(file_id)
+        
+        # 2. 处理需要从ES获取的文件
+        if file_ids_need_es:
+            # 使用scroll API获取所有分块
+            file_chunks = cls._scroll_file_chunks(es_client, knowledge.index_name, file_ids_need_es)
+            current_file_id = None
+            current_file_text = ""
+            
+            # 从ES中获取该文件的所有分块
+            for chunk in file_chunks:
+                chunk_file_id = chunk["_source"]["metadata"]["document_id"]
+                chunk_text = KnowledgeUtils.split_chunk_metadata(chunk["_source"]["text"])
+                processed_chunk_text = chunk_text.replace("\n", "").replace(" ", "")
+                
+                # 检查分块是否属于当前文件
+                if current_file_id is None:
+                    current_file_id = chunk_file_id
+                    current_file_text = processed_chunk_text
+                elif current_file_id == chunk_file_id:
+                    # 同一文件的分块，合并文本
+                    current_file_text += processed_chunk_text
+                    continue
+                else:
+                    # 不同文件，处理上一个文件
+                    # 生成ngram集合
+                    file_tzset = get_text_tzset(current_file_text)
+                    
+                    # 计算相似度
+                    similarity = len(base_set & file_tzset) / len(base_set | file_tzset) if (base_set | file_tzset) else 0
+                    
+                    # 获取文件URL
+                    original_url, preview_url = cls.get_file_share_url(current_file_id)
+                    
+                    # 添加到结果列表
+                    result.append({
+                        "file_id": current_file_id,
+                        "file_url": original_url,
+                        "preview_url": preview_url,
+                        "similar": similarity
+                    })
+                    
+                    # 存入Redis缓存，设置1小时过期
+                    ng_word_key = get_ng_word_key(current_file_id)
+                    redis_client.set(ng_word_key, file_tzset, expiration=3600)
+                    logger.info(f"Save file ngram to Redis, file_id: {current_file_id}")
+                    
+                    # 更新当前文件信息
+                    current_file_id = chunk_file_id
+                    current_file_text = processed_chunk_text
+            
+            # 处理最后一个文件
+            if current_file_id:
+                file_tzset = get_text_tzset(current_file_text)
+                
+                # 计算相似度
+                similarity = len(base_set & file_tzset) / len(base_set | file_tzset) if (base_set | file_tzset) else 0
+                
+                # 获取文件URL
+                original_url, preview_url = cls.get_file_share_url(current_file_id)
+                
+                # 添加到结果列表
+                result.append({
+                    "file_id": current_file_id,
+                    "file_url": original_url,
+                    "preview_url": preview_url,
+                    "similar": similarity
+                })
+                
+                # 存入Redis缓存
+                ng_word_key = get_ng_word_key(current_file_id)
+                redis_client.set(ng_word_key, file_tzset, expiration=3600*24)
+                logger.info(f"Save file ngram to Redis, file_id: {current_file_id}")
+            
+        
+        # 3. 按相似度排序并返回结果
         result.sort(key=lambda x:-x['similar'])
+        
+        # 记录总时间
+        total_time = time.time() - start_time
+        logger.info(f"get_similar_files_by_text total time: {total_time:.4f}s")
+        
         return result[:n]
