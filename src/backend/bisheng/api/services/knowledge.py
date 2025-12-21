@@ -1450,11 +1450,11 @@ class KnowledgeService(KnowledgeUtils):
         
         # 生成文件ngram集合的Redis键
         def get_ng_word_key(file_id: str) -> str:
-            return f"file_ngram:{file_id}"
+            return f"file_ngram_4:{file_id}"
 
         # 生成文本的ngram集合
         def get_text_tzset(text):
-            ngram = 2
+            ngram = 4
             wc = {}
             result = set()
             for i in range(len(text) - ngram + 1):
@@ -1467,12 +1467,12 @@ class KnowledgeService(KnowledgeUtils):
         knowledge = KnowledgeDao.query_by_id(knowledge_id)
         if not knowledge:
             raise NotFoundError.http_exception()
-        es_client = KnowledgeRag.init_knowledge_es_vectorstore_sync(knowledge)
+        # es_client = KnowledgeRag.init_knowledge_es_vectorstore_sync(knowledge)
 
         # 获取所有文件ID
         es_similar_doc_ngram = ESSimilarDocNGram(knowledge_id)
         text = es_similar_doc_ngram.preprocess_text(text)
-        file_ids_all = es_similar_doc_ngram.search_similar_docs_plus(text, max(n,100))
+        file_ids_all = es_similar_doc_ngram.search_similar_docs_plus(text, min(n*3,100))
         file_ids_need_es = []
         
         # 生成搜索文本的ngram集合

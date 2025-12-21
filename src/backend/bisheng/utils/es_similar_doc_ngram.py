@@ -416,8 +416,8 @@ class ESSimilarDocNGram:
             # 提取所有匹配的file_id
             match_ids = [hit["_source"]["file_id"] for hit in match_response["hits"]["hits"]]
             # 打印分数
-            for hit in match_response["hits"]["hits"]:
-                logger.info(f"文档[{hit['_source']['file_id']}] 匹配分数：{hit['_score']}")
+            # for hit in match_response["hits"]["hits"]:
+            #     logger.info(f"文档[{hit['_source']['file_id']}] 匹配分数：{hit['_score']}")
 
             logger.info(f"共检索到{len(match_ids)}个文档：{match_ids}")
             return match_ids[:top_n]
