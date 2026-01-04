@@ -44,8 +44,12 @@ class TagLinkBase(SQLModelSerializable):
 
 class TagLink(TagLinkBase, table=True):
     __table_args__ = (UniqueConstraint('resource_id', 'resource_type', 'tag_id', name='resource_tag_uniq'),)
+<<<<<<< HEAD
     # id: Optional[int] = Field(default=None, index=True, primary_key=True, description="标签关联唯一ID")
     id: Optional[int] = Field(default=None, description="标签关联唯一ID", sa_column=Column(Integer, primary_key=True, autoincrement=True))
+=======
+    id: Optional[int] = Field(default=None, index=True, primary_key=True, description="标签关联唯一ID")
+>>>>>>> zhongyuan_1215
     
 
 
